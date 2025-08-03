@@ -227,3 +227,103 @@ class BPETokenizer:
             tokens = self.encode(buffer)
             for token in tokens:
                 yield token
+
+
+def train_bpe(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str] | None = None,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Train a BPE tokenizer exactly matching the reference implementation."""
+    import re
+    from collections import defaultdict
+
+    if special_tokens is None:
+        special_tokens = []
+
+    # Initialize vocab with special tokens first, then bytes 0-255
+    # This matches the reference vocab structure where <|endoftext|> is at index 0
+    vocab = {}
+    vocab_id = 0
+
+    # Add special tokens first (they get lower IDs like in reference)
+    for special_token in special_tokens:
+        special_bytes = special_token.encode("utf-8")
+        vocab[vocab_id] = special_bytes
+        vocab_id += 1
+
+    # Add all 256 possible bytes after special tokens
+    for i in range(256):
+        vocab[vocab_id] = bytes([i])
+        vocab_id += 1
+
+    # Read corpus
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    # Split text by special tokens to avoid joining words incorrectly
+    text_chunks = [text]
+    for special_token in special_tokens:
+        new_chunks = []
+        for chunk in text_chunks:
+            # Split each chunk by the special token and keep non-empty parts
+            parts = chunk.split(special_token)
+            new_chunks.extend([part for part in parts if part])
+        text_chunks = new_chunks
+
+    # GPT-2 regex for pre-tokenization
+    pat = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\w+| ?\d+| ?[^\s\w\d]+|\s+(?!\S)|\s+""")
+
+    # Build word frequency dictionary with optimized structure
+    words = []
+    word_freqs = []
+    word_to_freq = defaultdict(int)
+
+    # Process each text chunk separately to avoid cross-contamination
+    for chunk in text_chunks:
+        for match in pat.finditer(chunk):
+            token = match.group()
+            if token:
+                word = tuple(bytes([b]) for b in token.encode("utf-8"))
+                word_to_freq[word] += 1
+
+    # Convert to lists for faster iteration
+    words = [list(word) for word in word_to_freq.keys()]
+    word_freqs = list(word_to_freq.values())
+
+    merges = []
+
+    # Training loop optimized for speed
+    while len(vocab) < vocab_size:
+        # Count all adjacent pairs
+        pairs = defaultdict(int)
+        for word, freq in zip(words, word_freqs):
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                pairs[pair] += freq
+
+        if not pairs:
+            break
+
+        # Find most frequent pair with deterministic tie-breaking
+        # In case of frequency ties, choose lexicographically last pair
+        max_freq = max(pairs.values())
+        candidates = [pair for pair, freq in pairs.items() if freq == max_freq]
+        best_pair = max(candidates)  # Lexicographically last
+        merged_token = best_pair[0] + best_pair[1]
+
+        # Add to merges and vocab
+        merges.append(best_pair)
+        vocab[len(vocab)] = merged_token
+
+        # Apply merge to all words in place for better performance
+        for word in words:
+            i = 0
+            while i < len(word) - 1:
+                if (word[i], word[i + 1]) == best_pair:
+                    # Replace pair with merged token
+                    word[i : i + 2] = [merged_token]
+                else:
+                    i += 1
+
+    return vocab, merges
